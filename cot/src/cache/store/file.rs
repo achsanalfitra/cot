@@ -61,6 +61,11 @@ use crate::error::error_impl::impl_into_cot_error;
 const ERROR_PREFIX: &str = "file-based cache store error:";
 const TEMPFILE_SUFFIX: &str = "tmp";
 
+// this is a Windows-specific error code
+// when we try to rename a file where the lock
+// might not be completely dropped
+const ERROR_ACCESS_DENIED: i32 = 5;
+
 // this header offset skips exactly one i64 integer,
 // which is the basis of our current expiry timestamp
 const EXPIRY_HEADER_OFFSET: usize = size_of::<i64>();
@@ -211,6 +216,12 @@ impl FileStore {
                 // because the data is already there.
                 Ok(())
             }
+            // this branch checks for access denied that might
+            // happen during race conditions on Windows
+            // when we try to rename the file. We are passing this
+            // because another thread/process is probably writing
+            // a newer cache file
+            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => Ok(()),
             Err(e) => Err(FileCacheStoreError::Io(Box::new(e)))?,
         }
     }
