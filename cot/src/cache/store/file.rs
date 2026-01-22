@@ -65,12 +65,6 @@ const TEMPFILE_SUFFIX: &str = "tmp";
 // which is the basis of our current expiry timestamp
 const EXPIRY_HEADER_OFFSET: usize = size_of::<i64>();
 
-// these are error codes for Windows
-// when locked files are accessed by
-// other process/threads
-const ERROR_SHARING_VIOLATION: i32 = 32;
-const ERROR_LOCK_VIOLATION: i32 = 33;
-
 /// Errors specific to the file based cache store.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -172,7 +166,9 @@ impl FileStore {
 
                 if path.extension().is_some_and(|ext| ext == TEMPFILE_SUFFIX)
                     && let Ok(file) = std::fs::File::open(&path)
-                    && file.try_lock_exclusive().is_ok()
+                    && file
+                        .try_lock_exclusive()
+                        .is_ok_and(|lock_aquired| lock_aquired)
                 {
                     let _ = std::fs::remove_file(path);
                 }
@@ -358,7 +354,9 @@ impl FileStore {
                 .await
             {
                 Ok(handle) => {
-                    if handle.try_lock_exclusive().is_ok() {
+                    if let Ok(lock_aquired) = handle.try_lock_exclusive()
+                        && lock_aquired
+                    {
                         handle
                             .set_len(0)
                             .await
@@ -373,10 +371,6 @@ impl FileStore {
                         .await
                         .map_err(|e| FileCacheStoreError::DirCreation(Box::new(e)))?;
                 }
-                // retry for Windows specific error
-                Err(e)
-                    if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
-                        || e.raw_os_error() == Some(ERROR_LOCK_VIOLATION) => {}
                 Err(e) => {
                     return Err(FileCacheStoreError::TempFileCreation(Box::new(e)))?;
                 }
