@@ -53,6 +53,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::task::spawn_blocking;
 
 use crate::cache::store::{CacheStore, CacheStoreError, CacheStoreResult};
 use crate::config::Timeout;
@@ -203,27 +204,32 @@ impl FileStore {
             .await
             .map_err(|e| FileCacheStoreError::Io(Box::new(e)))?;
 
+        match tokio::fs::rename(&file_path, self.dir_path.join(&key_hash)).await {
+            // Ok(()) => Ok(()),
+            Ok(()) => {}
+            _ => {
+                println!("TODO");
+            } // Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+              //     // if the source temp file is gone, it means another thread
+              //     // likely renamed it already or the directory was cleared.
+              //     // In a thundering herd, this is actually a "success" state
+              //     // because the data is already there.
+              //     Ok(())
+              // }
+              // // this branch checks for access denied that might
+              // // happen during race conditions on Windows
+              // // when we try to rename the file. We are passing this
+              // // because another thread/process is probably writing
+              // // a newer cache file
+              // Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => Ok(()),
+              // Err(e) => Err(FileCacheStoreError::Io(Box::new(e)))?,
+        }
+
         file.unlock_async()
             .await
             .map_err(|e| FileCacheStoreError::Io(Box::new(e)))?;
 
-        match tokio::fs::rename(&file_path, self.dir_path.join(&key_hash)).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // if the source temp file is gone, it means another thread
-                // likely renamed it already or the directory was cleared.
-                // In a thundering herd, this is actually a "success" state
-                // because the data is already there.
-                Ok(())
-            }
-            // this branch checks for access denied that might
-            // happen during race conditions on Windows
-            // when we try to rename the file. We are passing this
-            // because another thread/process is probably writing
-            // a newer cache file
-            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => Ok(()),
-            Err(e) => Err(FileCacheStoreError::Io(Box::new(e)))?,
-        }
+        Ok(())
     }
 
     async fn read(&self, key: &str) -> CacheStoreResult<Option<Value>> {
@@ -349,6 +355,7 @@ impl FileStore {
         Ok(Some(value))
     }
 
+    #[allow(clippy::incompatible_msrv)]
     async fn create_file_temp(
         &self,
         key_hash: &str,
@@ -365,15 +372,48 @@ impl FileStore {
                 .await
             {
                 Ok(handle) => {
-                    if let Ok(lock_aquired) = handle.try_lock_exclusive()
-                        && lock_aquired
-                    {
-                        handle
-                            .set_len(0)
-                            .await
-                            .map_err(|e| FileCacheStoreError::TempFileCreation(Box::new(e)))?;
+                    match handle.try_lock_exclusive() {
+                        Ok(lock) if lock => {
+                            handle
+                                .set_len(0)
+                                .await
+                                .map_err(|e| FileCacheStoreError::TempFileCreation(Box::new(e)))?;
+                            break handle;
+                        }
+                        _ => {
+                            let temp_path_clone = temp_path.clone();
+                            // hand off to blocking thread
+                            let task_handoff: Result<std::fs::File, FileCacheStoreError> =
+                                spawn_blocking(move || {
+                                    let file_std = std::fs::OpenOptions::new()
+                                        .write(true)
+                                        .read(true)
+                                        .create(true)
+                                        .truncate(false)
+                                        .open(&temp_path_clone)
+                                        .map_err(|e| {
+                                            FileCacheStoreError::TempFileCreation(Box::new(e))
+                                        })?;
+                                    let _ = file_std.lock().map_err(|e| {
+                                        FileCacheStoreError::TempFileCreation(Box::new(e))
+                                    });
+                                    let _ = file_std.set_len(0).map_err(|e| {
+                                        FileCacheStoreError::TempFileCreation(Box::new(e))
+                                    });
+                                    Ok(file_std)
+                                })
+                                .await
+                                .map_err(|e| FileCacheStoreError::TempFileCreation(Box::new(e)))?;
 
-                        break handle;
+                            match task_handoff {
+                                Ok(new_file) => break tokio::fs::File::from_std(new_file),
+                                Err(e) => {
+                                    return Err(FileCacheStoreError::TempFileCreation(Box::new(
+                                        e,
+                                    )))?;
+                                }
+                            }
+                        }
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
